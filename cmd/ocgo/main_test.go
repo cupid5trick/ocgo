@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestMain(m *testing.M) {
@@ -33,6 +35,176 @@ func TestMain(m *testing.M) {
 	officialModels = oldOfficialModels
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
+}
+
+// redirectConfigFile points the config loader at a temp file for the duration of
+// one test. t.Setenv and this hook keep tests hermetic and non-parallel.
+func redirectConfigFile(t *testing.T, dir string) {
+	t.Helper()
+	old := configFile
+	configFile = func() string { return filepath.Join(dir, "config.json") }
+	t.Cleanup(func() { configFile = old })
+}
+
+func TestLoadConfigPrefersEnvOverConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	redirectConfigFile(t, dir)
+	body := `{"api_key":"file-key","host":"10.0.0.5","port":4000}`
+	if err := os.WriteFile(configFile(), []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OCGO_API_KEY", "env-key")
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.Host != "10.0.0.5" || cfg.Port != 4000 {
+		t.Fatalf("config file values not honored: %+v", cfg)
+	}
+
+	t.Setenv(hostEnv, "0.0.0.0")
+	t.Setenv(portEnv, "3457")
+	cfg, err = loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig with env overrides: %v", err)
+	}
+	if cfg.Host != "0.0.0.0" || cfg.Port != 3457 {
+		t.Fatalf("env overrides did not win: %+v", cfg)
+	}
+}
+
+func TestLoadConfigFallsBackWhenEnvUnset(t *testing.T) {
+	dir := t.TempDir()
+	redirectConfigFile(t, dir)
+	t.Setenv("OCGO_API_KEY", "env-key")
+	t.Setenv(hostEnv, "")
+	t.Setenv(portEnv, "")
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.Host != defaultHost || cfg.Port != defaultPort {
+		t.Fatalf("defaults not applied: %+v", cfg)
+	}
+}
+
+func TestLoadConfigRejectsInvalidPortEnv(t *testing.T) {
+	dir := t.TempDir()
+	redirectConfigFile(t, dir)
+	t.Setenv("OCGO_API_KEY", "env-key")
+
+	for _, raw := range []string{"0", "-1", "65536", "abc", "3456x"} {
+		t.Setenv(portEnv, raw)
+		cfg, err := loadConfig()
+		if err == nil {
+			t.Fatalf("%s=%q accepted, want error (got %+v)", portEnv, raw, cfg)
+		}
+		if !strings.Contains(err.Error(), portEnv) {
+			t.Fatalf("%s=%q error does not name the variable: %v", portEnv, raw, err)
+		}
+	}
+}
+
+func TestDialHostNormalizesWildcardAndIPv6(t *testing.T) {
+	cases := map[string]string{
+		"127.0.0.1": "127.0.0.1",
+		"10.0.0.5":  "10.0.0.5",
+		"0.0.0.0":   defaultHost,
+		"::":        defaultHost,
+		"[::]":      defaultHost,
+		"":          defaultHost,
+		"::1":       "[::1]",
+		"fe80::1":   "[fe80::1]",
+	}
+	for in, want := range cases {
+		if got := dialHost(in); got != want {
+			t.Errorf("dialHost(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestBaseURLIsDialableForWildcardBind(t *testing.T) {
+	cases := []struct {
+		host string
+		port int
+		want string
+	}{
+		{"127.0.0.1", 3456, "http://127.0.0.1:3456"},
+		{"0.0.0.0", 3456, "http://127.0.0.1:3456"},
+		{"::", 8080, "http://127.0.0.1:8080"},
+		{"10.0.0.5", 4000, "http://10.0.0.5:4000"},
+		{"::1", 3456, "http://[::1]:3456"},
+	}
+	for _, c := range cases {
+		cfg := Config{Host: c.host, Port: c.port}
+		if got := baseURL(cfg); got != c.want {
+			t.Errorf("baseURL(host=%q port=%d) = %q, want %q", c.host, c.port, got, c.want)
+		}
+	}
+}
+
+// redirectPidFile points the pid file at a temp dir so a test that starts a real
+// server does not touch the user's ~/.config/ocgo.
+func redirectPidFile(t *testing.T, dir string) {
+	t.Helper()
+	old := pidFile
+	pidFile = func() string { return filepath.Join(dir, "ocgo.pid") }
+	t.Cleanup(func() { pidFile = old })
+}
+
+// nonLoopbackIPv4 returns a routable IPv4 address for this host, or "" when the
+// host has only loopback configured.
+func nonLoopbackIPv4() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return ""
+	}
+	for _, a := range addrs {
+		ipnet, ok := a.(*net.IPNet)
+		if !ok || ipnet.IP.IsLoopback() {
+			continue
+		}
+		if v4 := ipnet.IP.To4(); v4 != nil {
+			return v4.String()
+		}
+	}
+	return ""
+}
+
+// TestRunServerBindsWildcardHost is the regression test for the container bug:
+// with the listen address hardcoded to 127.0.0.1 the proxy accepted connections
+// only on loopback, so another container reaching it over the Docker bridge was
+// refused. Binding 0.0.0.0 must be reachable on this host's routable address.
+func TestRunServerBindsWildcardHost(t *testing.T) {
+	ip := nonLoopbackIPv4()
+	if ip == "" {
+		t.Skip("no non-loopback IPv4 address available")
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	redirectPidFile(t, t.TempDir())
+	cfg := Config{APIKey: "test-key", Host: "0.0.0.0", Port: port}
+	go func() { _ = runServer(cfg) }()
+
+	base := fmt.Sprintf("http://%s:%d", ip, port)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if healthy(base) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("wildcard bind was not reachable at %s/health", base)
 }
 
 func TestWriteCodexProfile(t *testing.T) {

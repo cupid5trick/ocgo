@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -30,6 +31,14 @@ const (
 	openAIURL                          = "https://opencode.ai/zen/go/v1/chat/completions"
 	codexProfileName                   = "ocgo-launch"
 	maxAnthropicToolResultContentChars = 120000
+)
+
+// hostEnv and portEnv override the listen address at run time. They take
+// precedence over config.json so a container image can be started with
+// OCGO_HOST=0.0.0.0 without mounting a config file.
+const (
+	hostEnv = "OCGO_HOST"
+	portEnv = "OCGO_PORT"
 )
 
 var version = "dev"
@@ -768,7 +777,7 @@ func launchCmd() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		base := fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)
+		base := baseURL(cfg)
 		serverCmd, err := startLaunchServer(base)
 		if err != nil {
 			return err
@@ -836,7 +845,7 @@ func launchCmd() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		base := fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)
+		base := baseURL(cfg)
 		if err := ensureCodexConfig(base); err != nil {
 			return fmt.Errorf("failed to configure codex: %w", err)
 		}
@@ -922,20 +931,52 @@ func stopCmd() *cobra.Command {
 func statusCmd() *cobra.Command {
 	return &cobra.Command{Use: "status", Short: "Show proxy status", Run: func(cmd *cobra.Command, args []string) {
 		cfg, err := loadConfig()
-		if err != nil || !healthy(fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)) {
+		base := baseURL(cfg)
+		if err != nil || !healthy(base) {
 			fmt.Println("Proxy is not running")
 			return
 		}
 		if pid, err := readPID(); err == nil {
-			fmt.Printf("Proxy is running on %s:%d (PID %d)\n", cfg.Host, cfg.Port, pid)
+			fmt.Printf("Proxy is running on %s (PID %d)\n", base, pid)
 			return
 		}
 		if pid, err := findListenerPID(cfg.Port); err == nil {
-			fmt.Printf("Proxy is running on %s:%d (PID %d, discovered from listener)\n", cfg.Host, cfg.Port, pid)
+			fmt.Printf("Proxy is running on %s (PID %d, discovered from listener)\n", base, pid)
 			return
 		}
-		fmt.Printf("Proxy is running on %s:%d (no ocgo PID file)\n", cfg.Host, cfg.Port)
+		fmt.Printf("Proxy is running on %s (no ocgo PID file)\n", base)
 	}}
+}
+
+// isWildcardHost reports whether host binds every interface rather than one
+// specific address.
+func isWildcardHost(host string) bool {
+	switch strings.TrimSpace(host) {
+	case "", "0.0.0.0", "::", "[::]":
+		return true
+	}
+	return false
+}
+
+// dialHost converts a bind address into one a client can dial. A wildcard bind
+// is reachable over loopback, and a bare IPv6 literal needs brackets before it
+// can appear in a URL.
+func dialHost(host string) string {
+	h := strings.TrimSpace(host)
+	if isWildcardHost(h) {
+		return defaultHost
+	}
+	if strings.Contains(h, ":") && !strings.HasPrefix(h, "[") {
+		return "[" + h + "]"
+	}
+	return h
+}
+
+// baseURL is the URL clients use to reach the proxy. The proxy's own tools
+// (launch, status) must dial dialHost rather than cfg.Host, because 0.0.0.0 is
+// a bind address and not a valid destination on macOS and Windows.
+func baseURL(cfg Config) string {
+	return fmt.Sprintf("http://%s:%d", dialHost(cfg.Host), cfg.Port)
 }
 
 func runServer(cfg Config) error {
@@ -949,8 +990,11 @@ func runServer(cfg Config) error {
 	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) { proxyMessages(w, r, cfg) })
 	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) { proxyChatCompletions(w, r, cfg) })
 	mux.HandleFunc("/v1/responses", func(w http.ResponseWriter, r *http.Request) { proxyResponses(w, r, cfg) })
-	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 	fmt.Printf("ocgo proxy listening on http://%s\n", addr)
+	if isWildcardHost(cfg.Host) {
+		fmt.Fprintf(os.Stderr, "warning: bound to %s, which accepts connections from any interface. ocgo does not authenticate inbound requests, so anyone who can reach this port can spend your OpenCode Go quota. Keep it on a trusted network or restrict access at the firewall.\n", cfg.Host)
+	}
 	return http.ListenAndServe(addr, mux)
 }
 
@@ -3123,9 +3167,13 @@ func startServerProcess(detached bool) (*exec.Cmd, error) {
 	return cmd, nil
 }
 
-func configDir() string  { home, _ := os.UserHomeDir(); return filepath.Join(home, ".config", "ocgo") }
-func configFile() string { return filepath.Join(configDir(), "config.json") }
-func pidFile() string    { return filepath.Join(configDir(), "ocgo.pid") }
+func configDir() string { home, _ := os.UserHomeDir(); return filepath.Join(home, ".config", "ocgo") }
+
+// configFile is a var so tests can redirect it, matching modelMappingFile.
+var configFile = func() string { return filepath.Join(configDir(), "config.json") }
+
+// pidFile is a var so a test that starts a real server can redirect it.
+var pidFile = func() string { return filepath.Join(configDir(), "ocgo.pid") }
 
 var modelMappingFile = func() string { return filepath.Join(configDir(), "model-mapping.json") }
 
@@ -3358,6 +3406,20 @@ func loadConfig() (Config, error) {
 	}
 	if cfg.APIKey == "" {
 		return cfg, errors.New("missing API key; run: ocgo setup")
+	}
+	// Environment overrides win over config.json so a container can choose its
+	// listen address without mounting a config file. A background serve spawns
+	// itself as a child process and inherits these, so the flagless path stays
+	// consistent with the foreground one.
+	if host := strings.TrimSpace(os.Getenv(hostEnv)); host != "" {
+		cfg.Host = host
+	}
+	if raw := strings.TrimSpace(os.Getenv(portEnv)); raw != "" {
+		port, err := strconv.Atoi(raw)
+		if err != nil || port < 1 || port > 65535 {
+			return cfg, fmt.Errorf("invalid %s %q: expected a port between 1 and 65535", portEnv, raw)
+		}
+		cfg.Port = port
 	}
 	if cfg.Host == "" {
 		cfg.Host = defaultHost
