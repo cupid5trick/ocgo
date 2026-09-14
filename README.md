@@ -111,7 +111,20 @@ You can also provide the key at runtime with an environment variable:
 export OCGO_API_KEY=sk-opencode-your-key
 ```
 
-By default, the local proxy listens on `127.0.0.1:3456`.
+By default, the local proxy listens on `127.0.0.1:3456`. Override the listen
+address with `OCGO_HOST` and `OCGO_PORT`, which take precedence over
+`config.json`:
+
+```bash
+# Reachable from other hosts or containers.
+export OCGO_HOST=0.0.0.0
+export OCGO_PORT=3456
+```
+
+Binding a wildcard address exposes the proxy to every interface that can reach
+the port. `ocgo` does not authenticate inbound requests, so any client that can
+connect can send requests against your OpenCode Go quota. Keep the proxy on a
+trusted network, or restrict access with a firewall.
 
 ## Usage
 
@@ -309,6 +322,17 @@ Check whether the proxy is running:
 ocgo status
 ```
 
+The listen address defaults to `127.0.0.1:3456`. Set `OCGO_HOST` to bind a
+different interface, which is what a container needs so other containers can
+reach the proxy over the Docker network:
+
+```bash
+OCGO_HOST=0.0.0.0 ocgo serve
+```
+
+The same variables apply to the background form, because the background process
+inherits the environment of the command that started it.
+
 Stop the background proxy:
 
 ```bash
@@ -407,6 +431,9 @@ make release TAG=v0.1.0
 ```
 
 By default, releases are published to `emanuelcasco/ocgo` and the Homebrew formula is pushed to `emanuelcasco/homebrew-tap`. You can override those with `GITHUB_REPOSITORY=owner/repo` and `HOMEBREW_TAP_REPO=owner/homebrew-tap`.
+
+To publish a release without touching a Homebrew tap, run the build and upload
+steps directly instead of the full script, so no tap repository is required.
 
 The script builds macOS/Linux `amd64` and `arm64` archives, uploads them to GitHub Releases, and commits `Formula/ocgo.rb` to the tap repo.
 
